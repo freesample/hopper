@@ -10,6 +10,16 @@ static double NormUniformDraw() {
   return double(rand()) / double(RAND_MAX); 
 }
 
+Node::Node(const std::string& debug_name) :
+  debug_name_(debug_name)
+{
+  ClearEvidence();
+  ClearInitialized();
+}
+
+const std::string& Node::GetName() const {
+  return debug_name_;
+}
 
 double Node::GetValue() const {
   return value_;
@@ -63,7 +73,7 @@ const std::vector<Node*>& Node::GetParents() const {
   return parents_;
 }
 
-const int Node::GetNumParents() const {
+int Node::GetNumParents() const {
   return parents_.size();
 }
 
@@ -71,11 +81,17 @@ void Node::AddChild(Node* node) {
   children_.push_back(node);
 }
 
-void Node::AddParent(Node* node) {
-  parents_.push_back(node);
+void Node::EdgeFrom(Node* from) {
+  parents_.push_back(from);
+  from->AddChild(this);
 }
 
-GaussianNode::GaussianNode(const std::vector<double>& beta, double sigma2) :
+ContinuousNode::ContinuousNode(const std::string& debug_name) :
+  Node(debug_name)
+{}
+
+GaussianNode::GaussianNode(const std::vector<double>& beta, double sigma2, const std::string& debug_name) :
+    ContinuousNode(debug_name),
     beta_(beta),
     sigma2_(sigma2),
     half_inv_sigma2_(0.5 / sigma2),
@@ -83,8 +99,7 @@ GaussianNode::GaussianNode(const std::vector<double>& beta, double sigma2) :
 {}
 
 double GaussianNode::GetConditional() const {
-  double mean = GetMean();
-  return Gaussian(mean - GetValue(), half_inv_sigma2_);
+  return Gaussian(GetMean() - GetValue(), half_inv_sigma2_);
 }
 
 double GaussianNode::GetMean() const {
@@ -97,8 +112,18 @@ double GaussianNode::GetMean() const {
 }
 
 double GaussianNode::GetSample() {
-  double mean = GetMean();
-  return mean + gaussian_source_.Draw();
+  return GetMean() + gaussian_source_.Draw();
+}
+
+GaussianEvidenceNode::GaussianEvidenceNode(const std::vector<double>& beta, double sigma2, double value, const std::string& debug_name) :
+  GaussianNode(beta, sigma2, debug_name)
+{
+  SetValue(value);
+  SetEvidence();
+}
+
+double GaussianEvidenceNode::GetSample() {
+  return GetValue();
 }
 
 EvidenceNode::EvidenceNode(double value) {
@@ -106,23 +131,52 @@ EvidenceNode::EvidenceNode(double value) {
   SetEvidence();
 }
 
+double EvidenceNode::GetConditional() const {
+  return 1.0;
+}
+
 double EvidenceNode::GetSample() {
   return GetValue();
 }
 
-double EvidenceNode::GetConditional() const {
+UniformNode::UniformNode(double from, double to, const std::string& debug_name) :
+  ContinuousNode(debug_name),
+  from_(from),
+  to_(to)
+{}
+
+double UniformNode::GetConditional() const {
   return 1.0;
+  //return 1.0/(to_ - from_);
+}
+
+double UniformNode::GetSample() {
+  return NormUniformDraw() * (to_ - from_) + from_;
 }
 
 const std::vector<Node*>& Sampler::NonEvidenceNodes() const {
   return non_evidence_nodes_;
 }
 
-void Sampler::Register(Node* node) {
+int Sampler::Register(Node* node) {
   if (!node->IsEvidence()) {
     non_evidence_nodes_.push_back(node);
   }
-  all_nodes_.push_back(node);
+  all_nodes_.emplace_back(node);
+  return all_nodes_.size() - 1;
+}
+
+Node* Sampler::GetNode(int registration_idx) {
+  return all_nodes_[registration_idx].get();
+}
+
+
+void Sampler::Register(Worker* worker) {
+  worker_.reset(worker);
+}
+
+Worker* Sampler::GetWorker() {
+  return worker_.get();
 }
 
 GaussianSource::GaussianSource(double sigma2) :
@@ -145,22 +199,19 @@ double GaussianProposalDensity1D::Draw(double current_value) {
   return current_value + gaussian_source_.Draw();
 }
 
-const std::vector<Node*>& Sampler::GetAllNodes() const {
-  return all_nodes_;
-}
-
 MetroSampler::MetroSampler(ProposalDensity1D* proposal) :
     proposal_density_(proposal)
 {}
 
-void MetroSampler::Infer(Worker* worker, int num_iterations) {
-  Initialize();
+void MetroSampler::Infer(int num_iterations) {
+  std::cerr << "MetroSampler::Infer going for " << num_iterations << " iterations" << std::endl;
   for (int i = 0; i < num_iterations; ++i) {
     for (Node* node : NonEvidenceNodes()) {
       MetroStep(node);
     }
-    worker->Sample(GetAllNodes());
+    GetWorker()->Sample(this);
   }
+  std::cerr << "MetroSampler::Infer done" << std::endl;
 }
 
 void MetroSampler::MetroStep(Node* node) {
@@ -169,6 +220,13 @@ void MetroSampler::MetroStep(Node* node) {
   double likelihood_ratio = GetLikelihoodRatio(node, proposal, original);
   double transition_odds = GetTransitionProbabilityRatio(node, proposal, original);
   double transition_probability = likelihood_ratio * transition_odds; 
+  /*
+  std::cerr << "MetroSampler::MetroStep node [" << node->GetName()
+            << "] original: " << original
+            << " proposal: " << proposal
+            << " r_likelihood: " << likelihood_ratio
+            << std::endl;
+            */
   if (transition_probability >= 1.0 ||
       NormUniformDraw() < transition_probability) {
     node->SetValue(proposal);
@@ -178,8 +236,8 @@ void MetroSampler::MetroStep(Node* node) {
 }
 
 double MetroSampler::GetLikelihoodRatio(Node* node,
-                                                double proposal,
-                                                double original) {
+                                        double proposal,
+                                        double original) {
   return GetUnnormalizedLikelihood(node, proposal) /
           GetUnnormalizedLikelihood(node, original);
 }
@@ -196,6 +254,7 @@ double MetroSampler::GetUnnormalizedLikelihood(
   node->SetValue(value);
   double likelihood = node->GetConditional();
   for (Node* child : node->GetChildren()) {
+    // FIXME - change to log domain.
     likelihood *= child->GetConditional(); 
   }
   node->SetValue(original);
@@ -207,17 +266,11 @@ double GaussianProposalDensity1D::GetUnnormalizedTransitionProbability(
   return Gaussian(from - to, half_inv_sigma2_); 
 }
 
-void HistogramWorker::Sample(const std::vector<Node*>& nodes) {
-}
-
-void Sampler::Initialize() {
-  if (IsInitialized()) {
-    return;
-  }
+void Sampler::Reset() {
   std::unique_ptr<std::vector<Node*>> q1(new std::vector<Node*>);
   std::unique_ptr<std::vector<Node*>> q2(new std::vector<Node*>);
-  for (Node* node : GetAllNodes()) {
-    q1->push_back(node);
+  for (int i = 0; i < all_nodes_.size(); ++i) {
+    q1->push_back(all_nodes_[i].get());
   }
 
   while (!q1->empty()) {
@@ -237,18 +290,27 @@ void Sampler::Initialize() {
     q1.swap(q2);
   }
 
-  SetInitialized();
+  worker_->Reset();
 }
 
-void Sampler::SetInitialized() {
-  is_initialized_ = true;
+HistogramWorker::HistogramWorker(double range_start, double range_end, int num_bins, int node_idx) :
+  histogram_(range_start, range_end, num_bins),
+  node_idx_(node_idx)
+{}
+
+std::string HistogramWorker::ToJsonString() const {
+  return histogram_.ToJsonString();
 }
 
-void Sampler::ClearInitialized() {
-  is_initialized_ = false;
+void HistogramWorker::Reset() {
+  histogram_.Reset();
+  std::cerr << "HistogramWorker::Reset:" << std::endl;
+  std::cerr << histogram_.ToJsonString() << std::endl;
 }
 
-bool Sampler::IsInitialized() const {
-  return is_initialized_;
+void HistogramWorker::Sample(Sampler* sampler) {
+  double sample = sampler->GetNode(node_idx_)->GetValue();
+  //std::cerr << "HistogramWorker sample " << sample << std::endl; 
+  histogram_.Accumulate(sample);
 }
 

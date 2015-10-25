@@ -4,6 +4,8 @@
 #include <vector>
 #include <random>
 
+#include "histogram.h"
+
 class GaussianSource {
   private:
   std::normal_distribution<double> normal_distribution_;
@@ -21,6 +23,9 @@ class Node {
   bool is_evidence_;
   double value_;
   bool is_initialized_;
+  std::string debug_name_;
+
+  void AddChild(Node* node);
 
   public:
   virtual double GetConditional() const = 0;
@@ -38,10 +43,14 @@ class Node {
 
   const std::vector<Node*>& GetChildren() const;
   const std::vector<Node*>& GetParents() const;
-  const int GetNumParents() const;
+  int GetNumParents() const;
 
-  void AddChild(Node* node);
-  void AddParent(Node* node);
+  void EdgeFrom(Node* node);
+
+  const std::string& GetName() const;
+
+  protected:
+  Node(const std::string& debug_name = "hieronymous");
 };
 
 class DiscreteNode : public Node {
@@ -52,6 +61,9 @@ class DiscreteNode : public Node {
 class ContinuousNode : public Node {
   public:
   virtual double GetConditional() const = 0;
+
+  protected:
+  ContinuousNode(const std::string& debug_name = "anon_continuous");
 };
 
 class GaussianNode : public ContinuousNode {
@@ -62,17 +74,34 @@ class GaussianNode : public ContinuousNode {
   GaussianSource gaussian_source_;
 
   public:
-  GaussianNode(const std::vector<double>& beta, double sigma2);
+  GaussianNode(const std::vector<double>& beta, double sigma2, const std::string& debug_name = "anon_gaussian");
   double GetConditional() const override;
-  double GetSample() override;
+  virtual double GetSample() override;
   double GetMean() const;
+};
+
+class GaussianEvidenceNode : public GaussianNode {
+  public:
+  GaussianEvidenceNode(const std::vector<double>& beta, double sigma2, double value, const std::string& debug_name = "anon_gaussian_evidence");
+  double GetSample() override;
 };
 
 class EvidenceNode : public ContinuousNode {
   public:
   EvidenceNode(double value);
-  double GetSample() override;
   double GetConditional() const override;
+  double GetSample() override;
+};
+
+class UniformNode : public ContinuousNode {
+  public:
+  UniformNode(double from, double to, const std::string& debug_name = "anon_uniform");
+  double GetConditional() const override;
+  double GetSample() override;
+  
+  private:
+  double from_;
+  double to_;
 };
 
 class ProposalDensity1D {
@@ -93,32 +122,45 @@ class GaussianProposalDensity1D : public ProposalDensity1D {
   double GetUnnormalizedTransitionProbability(double from, double to) const override;
 };
 
+class Sampler;
+
 class Worker {
   public:
-  virtual void Sample(const std::vector<Node*>& nodes) = 0;
+  virtual void Reset() = 0;
+  virtual void Sample(Sampler* sampler) = 0;
 };
 
 class HistogramWorker : public Worker {
+  sampler::Histogram histogram_;
+  int node_idx_;
   public:
-  void Sample(const std::vector<Node*>& nodes) override;
+  HistogramWorker(double range_start, double range_end, int num_bins, int node_idx);
+
+  void Sample(Sampler* sampler) override;
+  void Reset() override;
+
+  std::string ToJsonString() const;
 };
 
 class Sampler {
   private:
   std::vector<Node*> non_evidence_nodes_;
-  std::vector<Node*> all_nodes_;
+  // Sampler owns Register()'ed Nodes.
+  std::vector<std::unique_ptr<Node>> all_nodes_;
+  std::unique_ptr<Worker> worker_;
   bool is_initialized_;
 
   public:
-  void Register(Node* node);
-  const std::vector<Node*>& GetAllNodes() const;
-  virtual void Infer(Worker* worker, int num_iterations) = 0;
-  bool IsInitialized() const;
-  void SetInitialized();
-  void ClearInitialized();
+  // Transfers ownership of Node to Sampler.
+  int Register(Node* node);
+  // Transfers ownership of Worker to Sampler.
+  void Register(Worker* worker);
+  void Reset();
+  virtual void Infer(int num_iterations) = 0;
+  Node* GetNode(int registration_idx);
+  Worker* GetWorker();
 
   protected:
-  void Initialize();
   const std::vector<Node*>& NonEvidenceNodes() const;
 };
 
@@ -135,7 +177,7 @@ class MetroSampler : public Sampler {
   
   public:
   MetroSampler(ProposalDensity1D* proposal);
-  void Infer(Worker* worker, int num_iterations) override;
+  void Infer(int num_iterations) override;
 };
 
 class GibbsSampler : public Sampler {
